@@ -34,6 +34,7 @@ import itertools
 import yaml
 from urllib.parse import urlparse
 from aiohttp import ClientPayloadError
+from utils import print_progress_bar
 
 DEVICE_NAME = "matrix-archive"
 
@@ -216,28 +217,31 @@ async def write_room_events(client, room):
         full_state=True, sync_filter={"room": {"timeline": {"limit": 1}}}
     )
     start_token = sync_resp.rooms.join[room.room_id].timeline.prev_batch
-
     # Generally, it should only be necessary to fetch back events but,
     # sometimes depending on the sync, front events need to be fetched
     # as well.
     fetch_room_events_ = partial(fetch_room_events, client, start_token, room)
-    back_fetched_events = await fetch_room_events_(MessageDirection.back)
-    front_fetched_events = await fetch_room_events_(MessageDirection.front)
-    fetched_events = [reversed(back_fetched_events), front_fetched_events]
-
     async with aiofiles.open(
         f"{OUTPUT_DIR}/{room.display_name}_{room.room_id}.yaml", "w"
     ) as f:
+        back_fetched_events = await fetch_room_events_(MessageDirection.back)
+        front_fetched_events = await fetch_room_events_(MessageDirection.front)
+        fetched_events = [reversed(back_fetched_events), front_fetched_events]
+
         print(f"Writing {room.room_id} room messages to disk...")
+        idx, event_count = 0, len(back_fetched_events) + len(front_fetched_events)
         failed_downloads = {}
         for events in fetched_events:
             for event in events:
+                idx += 1
+                print_progress_bar(idx, event_count, "", "f" if isinstance(event, RoomMessageMedia) else "m")
                 try:
                     failed_download = await write_event(client, room, f, event)
                     if failed_download is not None:
                         failed_downloads[event.event_id] =  failed_download
 
                 except exceptions.EncryptionError as e:
+                    print()
                     print(e, file=sys.stderr)
         if failed_downloads:
             async with aiofiles.open(
