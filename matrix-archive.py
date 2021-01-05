@@ -120,22 +120,25 @@ async def write_event(
             else:
                 await output_file.write(serialize_event({'type': "text", 'body': event.body}))
     elif isinstance(event, (RoomMessageMedia, RoomEncryptedMedia)):
-        media_data = await download_mxc(client, event.url)
         filename = choose_filename(f"{media_dir}/{event.body}")
-        async with aiofiles.open(filename, "wb") as f:
-            try:
-                await f.write(
-                    crypto.attachments.decrypt_attachment(
-                        media_data,
-                        event.source['content']['file']['key']['k'],
-                        event.source['content']['file']['hashes']['sha256'],
-                        event.source['content']['file']['iv']
+        if not args.no_media_dl:
+            # Sometimes the homeserver does not respond due to load so instead of interrupting the whole backup, just save the non-downloaded links and filenames and save the messages anyway so we can try to re-download the files later
+            media_data = await download_mxc(client, event.url)
+            async with aiofiles.open(filename, "wb") as f:
+                try:
+                    await f.write(
+                        crypto.attachments.decrypt_attachment(
+                            media_data,
+                            event.source["content"]["file"]["key"]["k"],
+                            event.source["content"]["file"]["hashes"]["sha256"],
+                            event.source["content"]["file"]["iv"]
+                        )
                     )
-                )
-            except KeyError:  # EAFP: Unencrypted media produces KeyError
-                await f.write(media_data)
-            # Set atime and mtime of file to event timestamp
-            os.utime(filename, ns=((event.server_timestamp * 1000000,) * 2))
+                except KeyError:  # EAFP: Unencrypted media produces KeyError
+                    await f.write(media_data)
+                # Set atime and mtime of file to event timestamp
+                os.utime(filename, ns=((event.server_timestamp * 1000000,) * 2))
+
 
         media_type = ""
         if isinstance(event, (RoomMessageImage, RoomEncryptedImage)):
@@ -248,7 +251,9 @@ if __name__ == "__main__":
     parser.add_argument("output_dir", default=".", nargs="?",
         help="directory to store output (optional; defaults to current directory)")
     parser.add_argument("--no-media", action="store_true",
-        help="don't download media")
+        help="don't download media and don't backup media events/messages")
+    parser.add_argument("--no-media-dl", action="store_true",
+        help="don't download media but backup media event/messages")
     parser.add_argument("--all-rooms", action="store_true",
         help="select all rooms")
     args = parser.parse_args()
