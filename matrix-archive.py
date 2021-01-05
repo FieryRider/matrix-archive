@@ -10,22 +10,29 @@ from nio import (
     RoomMessage,
     RoomMessageFormatted,
     RoomMessageMedia,
+    RoomMessageImage,
+    RoomMessageVideo,
+    RoomMessageAudio,
+    RoomMessageFile,
+    RoomEncryptedImage,
+    RoomEncryptedAudio,
+    RoomEncryptedVideo,
+    RoomEncryptedFile,
     crypto,
     store,
     exceptions
 )
 from functools import partial
 from typing import Union, TextIO
-from urllib.parse import urlparse
+import os
+import sys
 import aiofiles
 import argparse
 import asyncio
 import getpass
 import itertools
-import os
-import sys
 import yaml
-
+from urllib.parse import urlparse
 
 DEVICE_NAME = "matrix-archive"
 
@@ -79,25 +86,39 @@ async def write_event(
 ) -> None:
     if not args.no_media:
         media_dir = mkdir(f"{OUTPUT_DIR}/{room.display_name}_{room.room_id}_media")
+
     sender_name = f"<{event.sender}>"
     if event.sender in room.users:
         # If user is still present in room, include current nickname
         sender_name = f"{room.users[event.sender].display_name} {sender_name}"
+
+    in_reply_to = None
+    if 'm.relates_to' in event.source['content'] and 'm.in_reply_to' in event.source['content']['m.relates_to']:
+        in_reply_to = event.source['content']['m.relates_to']['m.in_reply_to']['event_id']
+
     serialize_event = lambda event_payload: yaml.dump(
         [
             {
-                **dict(
-                    sender_id=event.sender,
-                    sender_name=sender_name,
-                    timestamp=event.server_timestamp,
-                ),
+                'event_id': event.event_id,
+                'sender_id': event.sender,
+                'sender_name': sender_name,
+                'timestamp': event.server_timestamp,
                 **event_payload,
             }
         ]
     )
 
     if isinstance(event, RoomMessageFormatted):
-        await output_file.write(serialize_event(dict(type="text", body=event.body,)))
+        if event.format is not None:
+            if in_reply_to is not None:
+                await output_file.write(serialize_event({'type': "text", 'body': event.body, 'formatted_body': event.formatted_body, 'format': event.format, 'in_reply_to': in_reply_to}))
+            else:
+                await output_file.write(serialize_event({'type': "text", 'body': event.body, 'formatted_body': event.formatted_body, 'format': event.format}))
+        else:
+            if in_reply_to is not None:
+                await output_file.write(serialize_event({'type': "text", 'body': event.body, 'in_reply_to': in_reply_to}))
+            else:
+                await output_file.write(serialize_event({'type': "text", 'body': event.body}))
     elif isinstance(event, (RoomMessageMedia, RoomEncryptedMedia)):
         media_data = await download_mxc(client, event.url)
         filename = choose_filename(f"{media_dir}/{event.body}")
@@ -106,18 +127,34 @@ async def write_event(
                 await f.write(
                     crypto.attachments.decrypt_attachment(
                         media_data,
-                        event.source["content"]["file"]["key"]["k"],
-                        event.source["content"]["file"]["hashes"]["sha256"],
-                        event.source["content"]["file"]["iv"],
+                        event.source['content']['file']['key']['k'],
+                        event.source['content']['file']['hashes']['sha256'],
+                        event.source['content']['file']['iv']
                     )
                 )
             except KeyError:  # EAFP: Unencrypted media produces KeyError
                 await f.write(media_data)
             # Set atime and mtime of file to event timestamp
             os.utime(filename, ns=((event.server_timestamp * 1000000,) * 2))
-        await output_file.write(serialize_event(dict(type="media", src=filename,)))
+
+        media_type = ""
+        if isinstance(event, (RoomMessageImage, RoomEncryptedImage)):
+            media_type = "m.image"
+        elif isinstance(event, (RoomMessageAudio, RoomEncryptedAudio)):
+            media_type = "m.audio"
+        elif isinstance(event, (RoomMessageVideo, RoomEncryptedVideo)):
+            media_type = "m.video"
+        elif isinstance(event, (RoomMessageFile, RoomEncryptedFile)):
+            media_type = "m.file"
+        await output_file.write(serialize_event({
+            'type': media_type,
+            'body': event.body,
+            'mimetype': event.source['content']['info']['mimetype'] if "mimetype" in event.source['content']['info'] else None,
+            'src': filename
+        }))
+
     elif isinstance(event, RedactedEvent):
-        await output_file.write(serialize_event(dict(type="redacted",)))
+        await output_file.write(serialize_event({'type': "redacted"}))
 
 
 async def save_avatars(client: AsyncClient, room: MatrixRoom) -> None:
@@ -181,9 +218,9 @@ async def write_room_events(client, room):
                     await write_event(client, room, f, event)
                 except exceptions.EncryptionError as e:
                     print(e, file=sys.stderr)
+
     await save_avatars(client, room)
     print("Successfully wrote all room events to disk.")
-
 
 async def main() -> None:
     try:
