@@ -23,7 +23,7 @@ from nio import (
     exceptions
 )
 from functools import partial
-from typing import Union, TextIO
+from typing import Union, TextIO, Dict
 import os
 import sys
 import aiofiles
@@ -33,6 +33,7 @@ import getpass
 import itertools
 import yaml
 from urllib.parse import urlparse
+from aiohttp import ClientPayloadError
 
 DEVICE_NAME = "matrix-archive"
 
@@ -83,7 +84,7 @@ def choose_filename(filename):
 
 async def write_event(
     client: AsyncClient, room: MatrixRoom, output_file: TextIO, event: RoomMessage
-) -> None:
+) -> Dict[str, str]:
     if not args.no_media:
         media_dir = mkdir(f"{OUTPUT_DIR}/{room.display_name}_{room.room_id}_media")
 
@@ -108,6 +109,7 @@ async def write_event(
         ]
     )
 
+    failed_download = None
     if isinstance(event, RoomMessageFormatted):
         if event.format is not None:
             if in_reply_to is not None:
@@ -123,22 +125,30 @@ async def write_event(
         filename = choose_filename(f"{media_dir}/{event.body}")
         if not args.no_media_dl:
             # Sometimes the homeserver does not respond due to load so instead of interrupting the whole backup, just save the non-downloaded links and filenames and save the messages anyway so we can try to re-download the files later
-            media_data = await download_mxc(client, event.url)
-            async with aiofiles.open(filename, "wb") as f:
-                try:
-                    await f.write(
-                        crypto.attachments.decrypt_attachment(
-                            media_data,
-                            event.source["content"]["file"]["key"]["k"],
-                            event.source["content"]["file"]["hashes"]["sha256"],
-                            event.source["content"]["file"]["iv"]
+            try:
+                media_data = await download_mxc(client, event.url)
+                async with aiofiles.open(filename, "wb") as f:
+                    try:
+                        await f.write(
+                            crypto.attachments.decrypt_attachment(
+                                media_data,
+                                event.source["content"]["file"]["key"]["k"],
+                                event.source["content"]["file"]["hashes"]["sha256"],
+                                event.source["content"]["file"]["iv"]
+                            )
                         )
-                    )
-                except KeyError:  # EAFP: Unencrypted media produces KeyError
-                    await f.write(media_data)
-                # Set atime and mtime of file to event timestamp
-                os.utime(filename, ns=((event.server_timestamp * 1000000,) * 2))
-
+                    except KeyError:  # EAFP: Unencrypted media produces KeyError
+                        await f.write(media_data)
+                    # Set atime and mtime of file to event timestamp
+                    os.utime(filename, ns=((event.server_timestamp * 1000000,) * 2))
+            except ClientPayloadError:
+                failed_download = {'url': event.url,
+                            'filename': filename,
+                            'key': event.source["content"]["file"]["key"]["k"],
+                            'hash':event.source["content"]["file"]["hashes"]["sha256"],
+                            'iv': event.source["content"]["file"]["iv"],
+                            'server_timestamp': event.server_timestamp
+                        }
 
         media_type = ""
         if isinstance(event, (RoomMessageImage, RoomEncryptedImage)):
@@ -159,6 +169,7 @@ async def write_event(
     elif isinstance(event, RedactedEvent):
         await output_file.write(serialize_event({'type': "redacted"}))
 
+    return failed_download
 
 async def save_avatars(client: AsyncClient, room: MatrixRoom) -> None:
     avatar_dir = mkdir(f"{OUTPUT_DIR}/{room.display_name}_{room.room_id}_avatars")
@@ -200,30 +211,83 @@ async def fetch_room_events(
 
 
 async def write_room_events(client, room):
-    print(f"Fetching {room.room_id} room messages and writing to disk...")
+    print(f"Fetching {room.room_id} room messages...")
     sync_resp = await client.sync(
         full_state=True, sync_filter={"room": {"timeline": {"limit": 1}}}
     )
     start_token = sync_resp.rooms.join[room.room_id].timeline.prev_batch
+
     # Generally, it should only be necessary to fetch back events but,
     # sometimes depending on the sync, front events need to be fetched
     # as well.
     fetch_room_events_ = partial(fetch_room_events, client, start_token, room)
+    back_fetched_events = await fetch_room_events_(MessageDirection.back)
+    front_fetched_events = await fetch_room_events_(MessageDirection.front)
+    fetched_events = [reversed(back_fetched_events), front_fetched_events]
+
     async with aiofiles.open(
         f"{OUTPUT_DIR}/{room.display_name}_{room.room_id}.yaml", "w"
     ) as f:
-        for events in [
-            reversed(await fetch_room_events_(MessageDirection.back)),
-            await fetch_room_events_(MessageDirection.front),
-        ]:
+        print(f"Writing {room.room_id} room messages to disk...")
+        failed_downloads = {}
+        for events in fetched_events:
             for event in events:
                 try:
-                    await write_event(client, room, f, event)
+                    failed_download = await write_event(client, room, f, event)
+                    if failed_download is not None:
+                        failed_downloads[event.event_id] =  failed_download
+
                 except exceptions.EncryptionError as e:
                     print(e, file=sys.stderr)
+        if failed_downloads:
+            async with aiofiles.open(
+                    f"{OUTPUT_DIR}/{room.display_name}_{room.room_id}_faileddownloads.yaml", "w"
+            ) as fdf:
+                await fdf.write(yaml.dump(failed_downloads))
 
     await save_avatars(client, room)
     print("Successfully wrote all room events to disk.")
+
+async def redownload_failed_files(client, room):
+    print(f"Re-downloading {room.room_id} failed files...")
+    delete_file = True
+    async with aiofiles.open(
+            f"{OUTPUT_DIR}/{room.display_name}_{room.room_id}_faileddownloads.yaml", "r+"
+    ) as f:
+        failed_downloads = yaml.load(await f.read(), Loader=yaml.FullLoader)
+        completed_downloads = {}
+        for event_id, failed_download in failed_downloads.items():
+            try:
+                media_data = await download_mxc(client, failed_download['url'])
+                async with aiofiles.open(failed_download['filename'], "wb") as f:
+                    try:
+                        await f.write(
+                            crypto.attachments.decrypt_attachment(
+                                media_data,
+                                failed_download['key'],
+                                failed_download['hash'],
+                                failed_download['iv']
+                            )
+                        )
+                    except KeyError:  # EAFP: Unencrypted media produces KeyError
+                        await f.write(media_data)
+                    # Set atime and mtime of file to event timestamp
+                    os.utime(failed_download['filename'], ns=((failed_download['server_timestamp'] * 1000000,) * 2))
+                    completed_downloads[event_id] = failed_download
+            except ClientPayloadError:
+                pass
+
+        for event_id in completed_downloads:
+            del failed_downloads[event_id]
+
+        f.truncate(0)
+        f.seek(0)
+        if failed_downloads:
+            f.write(yaml.dump(failed_downloads))
+            delete_file = False
+
+    if delete_file:
+        os.remove(f"{OUTPUT_DIR}/{room.display_name}_{room.room_id}_faileddownloads.yaml")
 
 async def main() -> None:
     try:
@@ -234,11 +298,18 @@ async def main() -> None:
             sync_filter={"room": {"timeline": {"limit": 1}}})
         if args.all_rooms:
             for room in client.rooms.values():
-                await write_room_events(client, room)
+                if args.command == "re-download":
+                    await redownload_failed_files(client, room)
+                else:
+                    await write_room_events(client, room)
         else:
             while True:
                 room = await select_room(client)
-                await write_room_events(client, room)
+                if args.command == "re-download":
+                    await redownload_failed_files(client, room)
+                else:
+                    await write_room_events(client, room)
+                break
     except KeyboardInterrupt:
         sys.exit(1)
     finally:
@@ -248,13 +319,21 @@ async def main() -> None:
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument("output_dir", default=".", nargs="?",
+    subparsers = parser.add_subparsers(dest="command")
+    subparsers.required = True
+    parser_a = subparsers.add_parser("backup", help = "backup matrix room")
+    parser_b = subparsers.add_parser("re-download", help = "try to re-download failed file downloads (does not re-export messages again)")
+    parser_a.add_argument("output_dir", default=".", nargs="?",
         help="directory to store output (optional; defaults to current directory)")
-    parser.add_argument("--no-media", action="store_true",
+    parser_b.add_argument("output_dir", default=".", nargs="?",
+        help="directory to store output (optional; defaults to current directory)")
+    parser_a.add_argument("--no-media", action="store_true",
         help="don't download media and don't backup media events/messages")
-    parser.add_argument("--no-media-dl", action="store_true",
+    parser_a.add_argument("--no-media-dl", action="store_true",
         help="don't download media but backup media event/messages")
-    parser.add_argument("--all-rooms", action="store_true",
+    parser_a.add_argument("--all-rooms", action="store_true",
+        help="select all rooms")
+    parser_b.add_argument("--all-rooms", action="store_true",
         help="select all rooms")
     args = parser.parse_args()
     OUTPUT_DIR = mkdir(args.output_dir)
