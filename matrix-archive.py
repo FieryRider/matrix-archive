@@ -95,8 +95,11 @@ async def write_event(
         sender_name = f"{room.users[event.sender].display_name} {sender_name}"
 
     in_reply_to = None
-    if 'm.relates_to' in event.source['content'] and 'm.in_reply_to' in event.source['content']['m.relates_to']:
+    if "m.relates_to" in event.source['content'] and "m.in_reply_to" in event.source['content']['m.relates_to']:
         in_reply_to = event.source['content']['m.relates_to']['m.in_reply_to']['event_id']
+    replaces = None
+    if "m.relates_to" in event.source['content'] and "rel_type" in event.source['content']['m.relates_to'] and event.source['content']['m.relates_to']['rel_type'] == "m.replace":
+        replaces = event.source['content']['m.relates_to']['event_id']
 
     serialize_event = lambda event_payload: yaml.dump(
         [
@@ -112,16 +115,23 @@ async def write_event(
 
     failed_download = None
     if isinstance(event, RoomMessageFormatted):
-        if event.format is not None:
-            if in_reply_to is not None:
-                await output_file.write(serialize_event({'type': "text", 'body': event.body, 'formatted_body': event.formatted_body, 'format': event.format, 'in_reply_to': in_reply_to}))
-            else:
-                await output_file.write(serialize_event({'type': "text", 'body': event.body, 'formatted_body': event.formatted_body, 'format': event.format}))
+        if in_reply_to is not None:
+            await output_file.write(serialize_event({'type': "text", 'body': event.body, 'formatted_body': event.formatted_body, 'format': event.format, 'in_reply_to': in_reply_to}))
+        elif replaces is not None:
+            new_body = event.source['content']['m.new_content']['body']
+            new_format = None
+            new_formatted_body = None
+            if event.source['content']['m.new_content']['format'] is not None:
+                new_format = event.source['content']['m.new_content']['format']
+                new_formatted_body = event.source['content']['m.new_content']['formatted_body']
+
+            evnt = {'type': "text", 'body': event.body, 'formatted_body': event.formatted_body, 'format': event.format, 'replaces': replaces, 'new_body': new_body, 'new_format': new_format, 'new_formatted_body': new_formatted_body}
+            evnt = {k: v for k, v in evnt.items() if v is not None}
+            await output_file.write(serialize_event(evnt))
         else:
-            if in_reply_to is not None:
-                await output_file.write(serialize_event({'type': "text", 'body': event.body, 'in_reply_to': in_reply_to}))
-            else:
-                await output_file.write(serialize_event({'type': "text", 'body': event.body}))
+            evnt = {'type': "text", 'body': event.body, 'formatted_body': event.formatted_body, 'format': event.format}
+            evnt = {k: v for k, v in evnt.items() if v is not None}
+            await output_file.write(serialize_event(evnt))
     elif isinstance(event, (RoomMessageMedia, RoomEncryptedMedia)):
         filename = choose_filename(f"{media_dir}/{event.body}")
         if not args.no_media_dl:
