@@ -60,6 +60,9 @@ async def create_client() -> AsyncClient:
     await client.login(password, DEVICE_NAME)
     client.load_store()
     room_keys_path = input("Enter full path to room E2E keys: ")
+    if room_keys_path == "":
+        PrintUtils.smart_print("Skipping import of room keys")
+        return client
     room_keys_password = getpass.getpass("Room keys password: ")
     PrintUtils.smart_print("Importing keys. This may take a while...")
     await client.import_keys(room_keys_path, room_keys_password)
